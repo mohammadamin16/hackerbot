@@ -3,24 +3,26 @@ import axios from "axios";
 import * as cheerio from "cheerio";
 import * as dotenv from "dotenv";
 import OpenAI from "openai";
+import { Article } from "./types";
+import {
+  initializeDatabase,
+  isArticleProcessed,
+  insertProcessedArticle,
+  cleanupOldArticles,
+} from "./database";
 
 // Load environment variables from .env file
 dotenv.config();
 
 // Initialize bot with your token (you'll need to set this as an environment variable)
-const bot = new TelegramBot(process.env.BALE_BOT_TOKEN || "", {
+const telegramBot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN || "", {
+  polling: true,
+});
+
+const baleBot = new TelegramBot(process.env.BALE_BOT_TOKEN || "", {
   polling: true,
   baseApiUrl: "https://tapi.bale.ai",
 });
-
-interface Article {
-  title: string;
-  translatedTitle?: string;
-  summary?: string;
-  translatedSummary?: string;
-  link?: string;
-  imgUrl?: string;
-}
 
 // Initialize OpenAI client
 const openai = new OpenAI({
@@ -30,7 +32,6 @@ const openai = new OpenAI({
 
 // Function to translate text using OpenAI
 async function translateText(text: string): Promise<string> {
-  console.log("text", text);
   try {
     const completion = await openai.chat.completions.create({
       messages: [
@@ -41,16 +42,12 @@ async function translateText(text: string): Promise<string> {
       ],
       model: "gpt-4o-mini",
     });
-    console.log("result", JSON.stringify(completion.choices[0].message.content));
     return completion.choices[0]?.message?.content || text;
   } catch (error) {
     console.error("Translation error:", error);
     return text;
   }
 }
-
-// Store the last processed articles to avoid duplicates
-let lastProcessedArticles = new Set<Article>();
 
 // Function to fetch and parse articles from the website
 async function fetchArticles() {
@@ -91,14 +88,12 @@ async function fetchArticles() {
 async function sendNewArticles(chatId: string) {
   try {
     const articles = await fetchArticles();
-    const newArticles = articles.filter(
-      (article) =>
-        !Array.from(lastProcessedArticles).some(
-          (a) => a.title === article.title
-        )
-    );
 
-    for (const article of newArticles) {
+    for (const article of articles) {
+      // Check if article was already processed
+      const isProcessed = await isArticleProcessed(article.title);
+      if (isProcessed) continue;
+
       // Translate title and summary
       article.translatedTitle = await translateText(article.title);
       if (article.summary) {
@@ -108,49 +103,54 @@ async function sendNewArticles(chatId: string) {
       let message = `📰 *${article.title}* \n`;
       message += `🔰 ${article.translatedTitle}\n\n`;
       if (article.summary) {
-        // message += `📝 ${article.summary}\n`;
         message += `📌 ${article.translatedSummary}\n\n`;
       }
       message += `🔗 ${article.link}`;
 
       if (article.imgUrl) {
-        await bot.sendPhoto(chatId, article.imgUrl, {
+        await baleBot.sendPhoto(chatId, article.imgUrl, {
           caption: message,
           parse_mode: "HTML",
         });
       } else {
-        await bot.sendMessage(chatId, message, { parse_mode: "HTML" });
+        await baleBot.sendMessage(chatId, message, { parse_mode: "HTML" });
       }
-      lastProcessedArticles.add(article);
 
-      // Keep only the most recent articles in memory
-      if (lastProcessedArticles.size > 100) {
-        const articlesArray = Array.from(lastProcessedArticles);
-        lastProcessedArticles = new Set(articlesArray.slice(-50));
-      }
+      // Store the processed article in the database
+      await insertProcessedArticle(article);
     }
+
+    // Cleanup old articles periodically
+    await cleanupOldArticles();
   } catch (error) {
     console.error("Error sending articles:", error);
   }
 }
 
+// Initialize database when the bot starts
+initializeDatabase().catch(console.error);
+const msgIds: number[] = [];
+
 // Command to start the bot and set up the chat
-bot.onText(/\/start/, (msg) => {
+baleBot.onText(/\/start/, (msg) => {
+  if (msgIds.includes(msg.message_id)) {
+    return;
+  }
+  msgIds.push(msg.message_id);
   const chatId = msg.chat.id.toString();
-  bot.sendMessage(
-    chatId,
-    "Welcome! I will send you new Hacker News articles every 5 minutes."
-  );
+  baleBot.sendMessage(chatId, "Hey");
 
   // Set up the interval to check for new articles
-  setInterval(() => sendNewArticles(chatId), 5 * 60 * 1000);
+  setInterval(() => sendNewArticles(chatId), 8 * 60 * 60 * 1000);
 
   // Do an initial check immediately
   sendNewArticles(chatId);
+  sendNewArticles(process.env.BALE_CHANNEL_ID || " ");
 });
 
+baleBot.onText(/\/channel/, (msg) => {
+  baleBot.sendMessage(process.env.BALE_CHANNEL_ID || " ", "test");
+});
 // Enable graceful stop
-process.once("SIGINT", () => bot.stopPolling());
-process.once("SIGTERM", () => bot.stopPolling());
-
-translateText("hello").then(console.log).catch(console.error);
+process.once("SIGINT", () => baleBot.stopPolling());
+process.once("SIGTERM", () => baleBot.stopPolling());
